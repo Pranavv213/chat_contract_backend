@@ -8,6 +8,7 @@ import re
 from web3 import Web3
 from web3.middleware import geth_poa_middleware
 import os
+import copy
 
 app = FastAPI()
 
@@ -38,6 +39,33 @@ class QueryResponse(BaseModel):
     error: Optional[str] = None
     available_functions: List[str]
 
+def sanitize_abi(abi):
+    """Sanitize ABI to ensure all required fields are present"""
+    sanitized = []
+    for item in abi:
+        sanitized_item = copy.deepcopy(item)
+        
+        if sanitized_item.get('type') == 'function':
+            if 'outputs' not in sanitized_item:
+                sanitized_item['outputs'] = []
+            for output in sanitized_item.get('outputs', []):
+                if 'type' not in output:
+                    output['type'] = 'unknown'
+            for input_param in sanitized_item.get('inputs', []):
+                if 'type' not in input_param:
+                    input_param['type'] = 'unknown'
+                if 'name' not in input_param:
+                    input_param['name'] = 'param'
+        elif sanitized_item.get('type') in ['event', 'error']:
+            for input_param in sanitized_item.get('inputs', []):
+                if 'type' not in input_param:
+                    input_param['type'] = 'unknown'
+                if 'name' not in input_param:
+                    input_param['name'] = 'param'
+        
+        sanitized.append(sanitized_item)
+    return sanitized
+
 def get_view_functions(abi):
     """Extract view/pure functions from ABI"""
     functions = []
@@ -56,7 +84,7 @@ def format_parameters(inputs):
     params = []
     for inp in inputs:
         name = inp.get('name', 'param')
-        param_type = inp.get('type')
+        param_type = inp.get('type', 'unknown')
         params.append(f"{name}:{param_type}")
     return f"({', '.join(params)})"
 
@@ -66,17 +94,15 @@ def get_function_signature(func):
     inputs = func.get('inputs', [])
     outputs = func.get('outputs', [])
     
-    # Format parameters
     params = []
     for inp in inputs:
         param_name = inp.get('name', 'param')
-        param_type = inp.get('type')
+        param_type = inp.get('type', 'unknown')
         params.append(f"{param_name}:{param_type}")
     
-    # Format returns
     returns = []
     for out in outputs:
-        return_type = out.get('type')
+        return_type = out.get('type', 'unknown')
         return_name = out.get('name', 'output')
         returns.append(f"{return_name}:{return_type}")
     
@@ -85,6 +111,51 @@ def get_function_signature(func):
         signature += f" returns ({', '.join(returns)})"
     
     return signature
+
+def extract_json_from_text(text):
+    """Extract JSON from text, handling various formats"""
+    # Try to find JSON in the text
+    json_patterns = [
+        r'\{[^{}]*\}',  # Simple JSON object
+        r'```json\s*([\s\S]*?)\s*```',  # JSON in code block
+        r'```\s*([\s\S]*?)\s*```',  # JSON in generic code block
+        r'(\{[\s\S]*?\})',  # Multi-line JSON
+    ]
+    
+    for pattern in json_patterns:
+        matches = re.findall(pattern, text, re.DOTALL)
+        for match in matches:
+            try:
+                # If it's from a code block, use the captured group
+                if isinstance(match, tuple):
+                    match = match[0] if match else ''
+                # Clean up the JSON string
+                clean_json = match.strip()
+                # Try to parse it
+                data = json.loads(clean_json)
+                return data
+            except json.JSONDecodeError:
+                continue
+    
+    # Try to find function name and parameters without JSON
+    function_match = re.search(r'(?:function|Function)\s*["\']?(\w+)["\']?', text, re.IGNORECASE)
+    if function_match:
+        function_name = function_match.group(1)
+        # Try to find parameters
+        params_match = re.search(r'params?\s*:\s*\[([^\]]*)\]', text, re.IGNORECASE)
+        params = []
+        if params_match:
+            params_str = params_match.group(1)
+            # Extract quoted strings or numbers
+            param_matches = re.findall(r'["\']([^"\']*)["\']|(\b\d+\b)', params_str)
+            for p in param_matches:
+                if p[0]:  # Quoted string
+                    params.append(p[0])
+                elif p[1]:  # Number
+                    params.append(p[1])
+        return {"function": function_name, "params": params}
+    
+    return None
 
 def select_function_with_llm(query, functions):
     """Use local LLM to select the correct function and extract parameters"""
@@ -99,22 +170,20 @@ def select_function_with_llm(query, functions):
         inputs = func.get('inputs', [])
         outputs = func.get('outputs', [])
         
-        # Format input parameters with types
         if inputs:
             params = []
             for inp in inputs:
                 param_name = inp.get('name', 'param')
-                param_type = inp.get('type')
+                param_type = inp.get('type', 'unknown')
                 params.append(f"{param_name}:{param_type}")
             params_str = f"({', '.join(params)})"
         else:
             params_str = "()"
         
-        # Format return values
         if outputs:
             returns = []
             for out in outputs:
-                return_type = out.get('type')
+                return_type = out.get('type', 'unknown')
                 returns.append(return_type)
             returns_str = f" returns ({', '.join(returns)})"
         else:
@@ -125,45 +194,15 @@ def select_function_with_llm(query, functions):
     functions_text = "\n".join([f"  • {f}" for f in function_list])
     
     prompt = f"""
-You are an expert Smart Contract ABI Router and Function Selector.
+You are an expert Smart Contract ABI Router and Function Selector with deep understanding of blockchain protocols, token standards, DeFi, NFTs, DAOs, and various contract types.
 
-Your task is to analyze a user's natural language query and determine the SINGLE BEST read-only function from the provided smart contract ABI that can answer the user's question.
-
-The contract may be ANY type of contract, including but not limited to:
-
-- ERC20
-- ERC721
-- ERC1155
-- DAO
-- Governance
-- Staking
-- Lending
-- Marketplace
-- Auction
-- Event Management
-- Ticketing
-- Gaming
-- Identity
-- Real Estate
-- Supply Chain
-- DeFi
-- Social Protocols
-- Custom Smart Contracts
-
-Never assume the contract follows a token standard.
+Your task is to analyze a user's natural language query and determine the SINGLE BEST read-only (view/pure) function from the provided smart contract ABI that can answer the user's question.
 
 ================================================================
 AVAILABLE FUNCTIONS
 ================================================================
 
 {functions_text}
-
-Each function may contain:
-- Function Name
-- Input Parameters
-- Output Parameters
-- State Mutability
-- Documentation / Description (if available)
 
 ================================================================
 USER QUERY
@@ -172,218 +211,137 @@ USER QUERY
 "{query}"
 
 ================================================================
-OBJECTIVE
+CONTEXT & UNDERSTANDING
 ================================================================
 
-Determine:
+The contract could be ANY type including:
+- Tokens: ERC20, ERC721, ERC1155, ERC777, ERC4626
+- DeFi: Uniswap, Aave, Compound, Curve, Balancer, Lido
+- NFTs: OpenSea, Rarible, Foundation, Zora
+- DAOs: Governor, Aragon, Snapshot, Safe
+- Oracles: Chainlink, Pyth, Tellor
+- Bridges: Wormhole, Axelar, LayerZero
+- Gaming: Axie Infinity, The Sandbox, Decentraland
+- Identity: ENS, Lens, Ceramic
+- Real World Assets: RealT, Lofty
+- L2s: Arbitrum, Optimism, Base, zkSync
+- Wallets: Smart Contract Wallets, Multisig
+- Custom: ANY custom smart contract
 
-1. Which function best answers the user's question.
-2. Which parameter values should be supplied.
-3. Whether enough information exists to confidently call that function.
+===============================================================
+SMART PATTERN RECOGNITION
+===============================================================
 
-You must understand the user's INTENT.
+Function Name Patterns & Their Meanings:
 
-Do NOT simply match keywords.
+TOKEN PATTERNS:
+- balanceOf(address) → Query about balance, holdings, amount
+- name() → Query about token name
+- symbol() → Query about token symbol/ticker
+- decimals() → Query about decimal places
+- totalSupply() → Query about total supply, circulating supply
+- allowance(address,address) → Query about spending allowance, approval
+- getReserves() → Query about liquidity, reserves, pool size
+- getAmountOut(uint,uint,uint) → Query about swap rates, output amounts
+- tokenURI(uint256) → Query about NFT metadata, image, URL
 
-Analyze:
-- Function names
-- Parameter names
-- Return values
-- Documentation
-- Semantic meaning
+NFT PATTERNS:
+- ownerOf(uint256) → Query about NFT ownership, who owns
+- tokenOfOwnerByIndex(address,uint256) → Query about tokens owned by address
+- balanceOf(address) → Query about NFT count, how many NFTs
+- getApproved(uint256) → Query about NFT approval
+- isApprovedForAll(address,address) → Query about operator approval
 
-================================================================
-FUNCTION SELECTION RULES
-================================================================
+DEFI PATTERNS:
+- getPool(address,address) → Query about pool info, liquidity
+- getExchangeRate() → Query about exchange rate, conversion rate
+- getAPY() → Query about APY, interest rate, yield
+- getTotalDeposits() → Query about TVL, total value locked
+- getUserDeposit(address) → Query about user's deposit, position
+- calculateRewards(address) → Query about rewards, earnings
+- getPrice() → Query about price, value
 
-Select the function whose OUTPUT most directly answers the user's question.
+GOVERNANCE PATTERNS:
+- getProposal(uint256) → Query about proposal details
+- getVoter(address) → Query about voting power, votes
+- getDelegate(address) → Query about delegate, representation
+- getProposalCount() → Query about number of proposals
+- state(uint256) → Query about proposal status
 
-GOOD EXAMPLES:
+QUERY PATTERNS:
+- "my", "my balance", "my tokens" → Use functions taking no address or msg.sender
+- "balance of [address]" → Look for balanceOf(address) or similar
+- "owner of [id]" → Look for ownerOf(uint256) or similar
+- "total supply", "supply" → Look for totalSupply()
+- "price of", "how much" → Look for getPrice(), getAmountOut(), rate functions
+- "info", "details", "status" → Look for getInfo(), getDetails() functions
+- "list", "all", "get" → Look for getList(), getAll() functions
+- "[noun] of [address]" → Look for functions with address parameters
+- "[noun] of [id/number]" → Look for functions with uint parameters
 
-User:
-"What is the token name?"
+===============================================================
+PARAMETER EXTRACTION (CRITICAL)
+===============================================================
 
-Function:
-name()
+Extract parameters with high precision:
 
---------------------------------------------------
+ADDRESS PATTERNS:
+- Ethereum address: 0x[a-fA-F0-9]{{40}}
+- ENS name: *.eth (resolve to address if needed)
+- "my", "me", "mine" → Use caller's address (msg.sender)
 
-User:
-"Who owns NFT 42?"
+NUMBER PATTERNS:
+- Integer: \\b\\d+\\b
+- Decimal: \\b\\d+\\.\\d+\\b
+- Token ID: "token [id]", "NFT [id]"
+- Proposal ID: "proposal [id]"
 
-Function:
-ownerOf(42)
+STRING PATTERNS:
+- Quoted text: "([^"]*)"
+- Name: "name", "symbol" keywords
 
---------------------------------------------------
+BOOL PATTERNS:
+- "yes", "true", "enabled", "active" → true
+- "no", "false", "disabled", "inactive" → false
 
-User:
-"Show details of proposal 5"
+BYTES PATTERNS:
+- 0x[a-fA-F0-9]{{64}} (32 bytes)
 
-Function:
-getProposal(5)
+===============================================================
+FUNCTION SELECTION HIERARCHY
+===============================================================
 
---------------------------------------------------
+Priority 1: EXACT SEMANTIC MATCH
+- Function name matches query intent exactly
+- Example: "balanceOf" for "what is the balance"
 
-User:
-"How many attendees does event 10 have?"
+Priority 2: STRONG SEMANTIC MATCH
+- Function name partially matches query
+- Example: "getBalance" for "balance"
 
-Function:
-getAttendanceCount(10)
+Priority 3: PARAMETER MATCH
+- Function parameters match extracted values
+- Example: address parameter for address query
 
---------------------------------------------------
+Priority 4: CONTEXTUAL MATCH
+- Function fits the contract type context
+- Example: NFT function for NFT contract
 
-User:
-"Has address X voted?"
+===============================================================
+OUTPUT FORMAT - STRICT JSON ONLY
+===============================================================
 
-Function:
-hasVoted(X)
+Return ONLY valid JSON. No explanations, no markdown, no comments.
 
---------------------------------------------------
-
-User:
-"What is the current APY?"
-
-Function:
-currentAPY()
-
-================================================================
-PARAMETER EXTRACTION RULES
-================================================================
-
-Extract parameter values directly from the query.
-
-Examples:
-
-"balance of 0x742d35Cc6634C0532925a3b844Bc9e7595f0b3f2"
-
-Returns:
-
-["0x742d35Cc6634C0532925a3b844Bc9e7595f0b3f2"]
-
---------------------------------------------------
-
-"owner of token 55"
-
-Returns:
-
-["55"]
-
---------------------------------------------------
-
-"proposal 17 status"
-
-Returns:
-
-["17"]
-
---------------------------------------------------
-
-"event 42 details"
-
-Returns:
-
-["42"]
-
-Rules:
-
-- Preserve exact values
-- Do not modify addresses
-- Do not normalize values
-- Do not invent missing values
-- Extract parameters in the exact order required by the function
-
-================================================================
-MISSING PARAMETERS
-================================================================
-
-If the selected function requires parameters and the query does not provide all required values:
-
-Return:
-
+SUCCESSFUL MATCH:
 {{
-    "function": null,
-    "params": [],
-    "confidence": 0,
-    "reason": "Required parameter missing"
-}}
-
-Example:
-
-Query:
-"Who owns this NFT?"
-
-Function:
-ownerOf(tokenId)
-
-Since tokenId is missing:
-
-Return null.
-
-================================================================
-MULTIPLE POSSIBLE FUNCTIONS
-================================================================
-
-If multiple functions seem relevant:
-
-Choose the function whose OUTPUT most directly answers the question.
-
-Priority:
-
-1. Exact answer
-2. Strong semantic match
-3. Least unrelated data
-4. Fewest assumptions
-
-================================================================
-FUNCTION ELIMINATION RULES
-================================================================
-
-DO NOT choose a function if:
-
-- Parameters are missing
-- It requires guessing values
-- It only partially answers the question
-- It is unrelated to the query
-- It is payable
-- It changes contract state
-- It performs writes
-
-Prefer:
-
-- view functions
-- pure functions
-
-================================================================
-CONFIDENCE SCORING
-================================================================
-
-100 = exact semantic match
-90-99 = extremely strong match
-75-89 = strong match
-50-74 = weak match
-0 = insufficient information
-
-If confidence < 50:
-
-Return null.
-
-================================================================
-OUTPUT FORMAT
-================================================================
-
-Return ONLY valid JSON.
-
-Successful Match:
-
-{{
-    "function": "functionName",
-    "params": ["value1", "value2"],
+    "function": "exact_function_name",
+    "params": ["param1", "param2"],
     "confidence": 95,
     "reason": "Function directly answers the user's question"
 }}
 
-No Match:
-
+NO MATCH:
 {{
     "function": null,
     "params": [],
@@ -391,29 +349,72 @@ No Match:
     "reason": "No suitable function found"
 }}
 
-================================================================
-STRICT RULES
-================================================================
+===============================================================
+EXAMPLES ACROSS DIFFERENT CONTRACTS
+===============================================================
 
-- Output JSON only
-- No markdown
-- No code fences
-- No comments
-- No explanations outside JSON
-- No hallucinated functions
-- No hallucinated parameters
-- Use ONLY functions present in the ABI
-- Never guess IDs
-- Never guess addresses
-- Never guess proposal IDs
-- Never guess token IDs
-- Never guess event IDs
-- Never guess usernames
-- Never guess any missing value
+ERC20 Token Contract:
+User: "What is the balance of 0x742d35Cc6634C0532925a3b844Bc9e7595f0b3f2?"
+Functions: balanceOf(address), name(), symbol(), totalSupply()
+Response: {{"function": "balanceOf", "params": ["0x742d35Cc6634C0532925a3b844Bc9e7595f0b3f2"], "confidence": 100}}
 
-Return EXACTLY ONE function.
+NFT Contract:
+User: "Who owns token 123?"
+Functions: ownerOf(uint256), balanceOf(address), tokenURI(uint256)
+Response: {{"function": "ownerOf", "params": ["123"], "confidence": 100}}
 
-JSON ONLY:
+Uniswap V2 Pair:
+User: "What are the reserves?"
+Functions: getReserves(), price0CumulativeLast(), price1CumulativeLast()
+Response: {{"function": "getReserves", "params": [], "confidence": 100}}
+
+Aave Lending Pool:
+User: "What is my deposit amount?"
+Functions: getUserAccountData(address), getReserveData(address), balanceOf(address)
+Response: {{"function": "getUserAccountData", "params": [], "confidence": 95}}
+
+Governance DAO:
+User: "Status of proposal 42?"
+Functions: state(uint256), getProposal(uint256), getVoter(address)
+Response: {{"function": "state", "params": ["42"], "confidence": 95}}
+
+Chainlink Price Feed:
+User: "What is the current price?"
+Functions: latestRoundData(), getAnswer(), getRoundData(uint80)
+Response: {{"function": "latestRoundData", "params": [], "confidence": 100}}
+
+Lens Protocol:
+User: "Get my profile"
+Functions: getProfile(address), getProfilesByOwner(address), getFollowers(address)
+Response: {{"function": "getProfile", "params": [], "confidence": 95}}
+
+ENS Registry:
+User: "Get address for vitalik.eth"
+Functions: resolver(bytes32), owner(bytes32), setSubnodeRecord()
+Response: {{"function": "resolver", "params": ["vitalik.eth"], "confidence": 90}}
+
+Custom Todo Contract:
+User: "Todos of 0xdfe70B004f3e08fd81baC1626915590F6549ADBD"
+Functions: getUserTodosByAddress(address), getUserTodos(), getTodoCount()
+Response: {{"function": "getUserTodosByAddress", "params": ["0xdfe70B004f3e08fd81baC1626915590F6549ADBD"], "confidence": 100}}
+
+===============================================================
+CRITICAL RULES - DO NOT VIOLATE
+===============================================================
+
+1. NEVER hallucinate functions - use ONLY from provided list
+2. NEVER invent parameters - extract from query or use empty string
+3. NEVER guess IDs/addresses - only use what's in the query
+4. ALWAYS preserve exact formatting (address case, number format)
+5. ALWAYS return JSON only
+6. For "my" queries, return empty params array (use msg.sender)
+7. For public queries, include the address/number parameter
+8. PREFER view/pure functions over payable/write functions
+9. If multiple functions match, choose the most specific one
+10. If confidence < 50, return null
+
+===============================================================
+YOUR RESPONSE (JSON ONLY - NO OTHER TEXT):
 """
 
     try:
@@ -425,7 +426,7 @@ JSON ONLY:
                 "stream": False,
                 "options": {
                     "temperature": 0,
-                    "num_predict": 150,
+                    "num_predict": 200,
                     "top_p": 0.9,
                     "top_k": 40
                 }
@@ -438,37 +439,39 @@ JSON ONLY:
             text = result.get('response', '{}').strip()
             print(f"LLM Raw Response: {text}")
             
-            # Extract JSON
-            json_match = re.search(r'\{[^{}]*\}', text)
-            if json_match:
-                try:
-                    data = json.loads(json_match.group())
-                    function_name = data.get('function', '')
-                    
-                    # Verify function exists
-                    if function_name:
-                        # Find the function in ABI
-                        matching_func = next((f for f in functions if f.get('name') == function_name), None)
-                        if matching_func:
-                            # Check if function expects parameters
-                            expected_params = matching_func.get('inputs', [])
-                            provided_params = data.get('params', [])
-                            
-                            # If function expects no parameters but params were provided, clear them
-                            if len(expected_params) == 0:
-                                provided_params = []
-                            # If function expects parameters but none were provided, try to infer
-                            elif len(expected_params) > 0 and len(provided_params) == 0:
-                                # Try to extract from query
-                                extracted = extract_parameters_from_query(query, expected_params)
-                                if extracted:
-                                    provided_params = extracted
-                            
-                            return {"function": function_name, "params": provided_params}
-                except json.JSONDecodeError as e:
-                    print(f"JSON parse error: {e}")
+            # Try to extract JSON using our robust function
+            parsed_data = extract_json_from_text(text)
+            
+            if parsed_data:
+                function_name = parsed_data.get('function', '')
+                params = parsed_data.get('params', [])
+                
+                # Verify function exists
+                if function_name:
+                    matching_func = next((f for f in functions if f.get('name') == function_name), None)
+                    if matching_func:
+                        # Ensure we have the right number of parameters
+                        expected_params = matching_func.get('inputs', [])
+                        if len(expected_params) == 0:
+                            params = []
+                        elif len(params) < len(expected_params):
+                            # Try to extract missing parameters from query
+                            extracted = extract_parameters_from_query(query, expected_params)
+                            if extracted:
+                                params = extracted
+                        
+                        print(f"✅ Selected function: {function_name}")
+                        print(f"📋 Parameters: {params}")
+                        return {"function": function_name, "params": params}
+                    else:
+                        print(f"⚠️ Function '{function_name}' not found in ABI")
+                else:
+                    print("⚠️ No function name extracted from LLM response")
+            else:
+                print("⚠️ Could not parse JSON from LLM response")
         
         # Fallback: Smart keyword matching
+        print("🔄 Using fallback keyword matching...")
         query_lower = query.lower()
         keyword_score = {}
         
@@ -476,32 +479,22 @@ JSON ONLY:
             func_name = func.get('name', '').lower()
             score = 0
             
-            # Exact match
-            if func_name == query_lower:
-                score = 100
-            # Function name in query
-            elif func_name in query_lower:
-                score = 50
-            # Query in function name
-            elif query_lower in func_name:
-                score = 30
+            # Check if function name appears in query
+            if func_name in query_lower:
+                score += 50
             
-            # Additional keyword matching
+            # Check for keyword matches
             keywords = {
-                'balance': ['balance', 'holdings', 'amount', 'how much'],
-                'supply': ['supply', 'total', 'circulating'],
+                'balance': ['balance', 'holdings', 'amount'],
+                'supply': ['supply', 'total'],
                 'owner': ['owner', 'who owns'],
-                'name': ['name', 'token name', 'what is the name'],
+                'name': ['name', 'token name'],
                 'symbol': ['symbol', 'ticker'],
-                'price': ['price', 'cost', 'value'],
-                'rate': ['rate', 'apr', 'apy', 'interest'],
-                'reserve': ['reserve', 'liquidity', 'tvl'],
-                'proposal': ['proposal', 'vote', 'governance'],
-                'stake': ['stake', 'staked', 'staking'],
-                'reward': ['reward', 'earnings'],
-                'level': ['level', 'rank'],
-                'uri': ['uri', 'url', 'metadata'],
-                'decimals': ['decimals', 'decimal places']
+                'todos': ['todo', 'todos', 'task'],
+                'user': ['user', 'address', 'wallet'],
+                'proposal': ['proposal', 'vote'],
+                'stake': ['stake', 'staked'],
+                'reward': ['reward', 'earnings']
             }
             
             for key, words in keywords.items():
@@ -514,19 +507,18 @@ JSON ONLY:
             if score > 0:
                 keyword_score[func.get('name')] = score
         
-        # Get best match
         if keyword_score:
             best_func = max(keyword_score, key=keyword_score.get)
-            # Check if the function expects parameters
             matching_func = next((f for f in functions if f.get('name') == best_func), None)
             params = []
             if matching_func and matching_func.get('inputs', []):
-                # Try to extract parameters
                 extracted = extract_parameters_from_query(query, matching_func.get('inputs', []))
                 if extracted:
                     params = extracted
+            print(f"✅ Fallback selected: {best_func}")
             return {"function": best_func, "params": params}
         
+        print("❌ No function found")
         return {"function": "", "params": []}
         
     except requests.exceptions.Timeout:
@@ -550,9 +542,9 @@ def extract_parameters_from_query(query, expected_params):
             if address_match:
                 extracted.append(address_match.group())
             else:
-                # Check for "my" or "me" - could use a placeholder
+                # Check for "my" or "me"
                 if 'my' in query.lower() or 'me' in query.lower():
-                    extracted.append("0x0000000000000000000000000000000000000000")  # Placeholder
+                    extracted.append("0x0000000000000000000000000000000000000000")
                 else:
                     extracted.append("")
         # Try to find number
@@ -593,6 +585,9 @@ def extract_parameters_from_query(query, expected_params):
 def call_contract_function(contract_address: str, abi: List[Dict], function_name: str, params: List[str], rpc_url: str):
     """Call the contract function and return the result"""
     try:
+        # Sanitize the ABI before using it
+        sanitized_abi = sanitize_abi(abi)
+        
         # Initialize Web3
         w3 = Web3(Web3.HTTPProvider(rpc_url))
         
@@ -607,17 +602,17 @@ def call_contract_function(contract_address: str, abi: List[Dict], function_name
         if not w3.is_connected():
             raise Exception("Failed to connect to blockchain. Please check RPC URL.")
         
-        # Create contract instance
+        # Create contract instance with sanitized ABI
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(contract_address),
-            abi=abi
+            abi=sanitized_abi
         )
         
         # Get the function
         contract_function = getattr(contract.functions, function_name)
         
         # Get the function ABI to check parameter count
-        function_abi = next((item for item in abi if item.get('name') == function_name and item.get('type') == 'function'), None)
+        function_abi = next((item for item in sanitized_abi if item.get('name') == function_name and item.get('type') == 'function'), None)
         
         if not function_abi:
             raise Exception(f"Function '{function_name}' not found in ABI")
@@ -633,7 +628,7 @@ def call_contract_function(contract_address: str, abi: List[Dict], function_name
             converted_params = []
             for i, param in enumerate(params):
                 if i < len(expected_params):
-                    param_type = expected_params[i].get('type')
+                    param_type = expected_params[i].get('type', '')
                     try:
                         if param_type == 'address':
                             converted_params.append(Web3.to_checksum_address(param))
@@ -656,16 +651,21 @@ def call_contract_function(contract_address: str, abi: List[Dict], function_name
                 result = contract_function().call()
         
         # Format the result
-        if isinstance(result, bytes):
+        if isinstance(result, (bytes, bytearray)):
             try:
                 result = result.decode('utf-8')
             except:
                 result = '0x' + result.hex()
         elif isinstance(result, int):
-            # For large numbers, keep as int but ensure it's serializable
             result = result
-        elif hasattr(result, 'items'):  # Tuple-like result
-            result = dict(result)
+        elif isinstance(result, (list, tuple)):
+            result = list(result)
+        elif hasattr(result, '_asdict'):
+            result = result._asdict()
+        elif isinstance(result, dict):
+            pass
+        else:
+            result = str(result)
         
         return result
         
@@ -702,13 +702,14 @@ async def query_contract(request: QueryRequest):
             raise HTTPException(status_code=400, detail="No view/pure functions found in ABI. Contract must have view/pure functions to query.")
         
         print(f"📚 Total View Functions: {len(functions)}")
-        print(f"🔍 First 10 functions: {[f.get('name') for f in functions[:10]]}")
+        print(f"🔍 Available functions: {[f.get('name') for f in functions[:10]]}")
         
         # Select function with LLM
         selection = select_function_with_llm(request.query, functions)
         
-        if not selection.get("function"):
+        if not selection or not selection.get("function"):
             available_funcs = [f.get('name') for f in functions[:20]]
+            print("❌ No function selected")
             return QueryResponse(
                 success=False,
                 function="",
